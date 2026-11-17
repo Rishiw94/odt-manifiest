@@ -565,6 +565,58 @@
     pointer-events:none;
   }
 
+  /* Vehicle photo checks */
+  .veh-card{margin-bottom:12px;}
+  .veh-row{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+  .veh-name{font-size:14.5px;font-weight:700;}
+  .veh-sub{font-size:12px;color:var(--muted-dark);margin-top:2px;}
+  .veh-chip{
+    font-size:11px;font-weight:700;
+    padding:4px 9px;border-radius:999px;
+    white-space:nowrap;flex-shrink:0;
+  }
+  .veh-ok{background:#E1EFE6;color:var(--stamp-green-dark);}
+  .veh-warn{background:#FCEFD9;color:var(--stamp-orange-dark);}
+  .veh-late{background:#FBE3E0;color:var(--stamp-red-dark);}
+  .veh-damage{background:var(--stamp-red);color:#fff;}
+  .seg-row{display:flex;gap:8px;margin-bottom:16px;}
+  .seg-btn{
+    flex:1;text-align:center;
+    padding:10px 0;border-radius:10px;
+    border:1px solid var(--line-strong);
+    font-size:13px;font-weight:600;
+    cursor:pointer;background:transparent;color:var(--ink);
+  }
+  .seg-btn.active{background:var(--ink);color:#fff;border-color:var(--ink);}
+  .photo-slot-grid{
+    display:grid;grid-template-columns:1fr 1fr;gap:10px;
+    margin-bottom:6px;border-radius:12px;
+  }
+  .photo-slot-grid.input-error{outline:2px solid var(--stamp-red);outline-offset:4px;}
+  .photo-slot{
+    position:relative;
+    aspect-ratio:4/3;
+    border:1.5px dashed var(--line-strong);
+    border-radius:12px;
+    background:var(--paper-raised) center/cover no-repeat;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:4px;cursor:pointer;overflow:hidden;
+    font-size:12px;font-weight:600;color:var(--muted-dark);
+  }
+  .photo-slot.filled{border-style:solid;border-color:var(--stamp-green);color:#fff;}
+  .photo-slot .ps-icon{font-size:22px;}
+  .photo-slot .ps-label{
+    position:absolute;left:0;right:0;bottom:0;
+    background:rgba(26,29,41,0.55);color:#fff;
+    padding:4px 0;text-align:center;font-size:11.5px;
+  }
+  .photo-slot:not(.filled) .ps-label{position:static;background:none;color:var(--muted-dark);padding:0;}
+  .veh-photo-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px;}
+  .veh-photo-grid figure{margin:0;cursor:pointer;}
+  .veh-photo-grid figure.big{grid-column:1 / -1;}
+  .veh-photo-grid img{width:100%;border-radius:10px;display:block;}
+  .veh-photo-grid figcaption{font-size:11.5px;color:var(--muted-dark);margin-top:4px;}
+
   ::-webkit-scrollbar{display:none;}
 </style>
 </head>
@@ -716,6 +768,11 @@ let state = {
   toast: null,
   selectMode: false,      // Admin-only: multi-select in the Manifest list for bulk delete
   selectedIds: [],
+  vehicleChecks: [],      // photo checks of the vehicles (Driver / Operations / Admin)
+  vehicleChecksLoaded: false,
+  vehicleChecksLoading: false,
+  vehicleError: null,
+  vehicleFilter: 'all',
 };
 
 function isValidODTFormat(v){
@@ -895,6 +952,99 @@ async function deleteODTs(ids){
   }
 }
 
+// ---------- Vehicle photo checks ----------
+// Stored in their own collection, same split as ODTs: a light meta document
+// (list view) plus one small document per photo in a `photos` subcollection,
+// fetched only when someone opens that specific check.
+const VEHICLE_SLOTS = [
+  {key:'front',    label:'Front'},
+  {key:'rear',     label:'Rear'},
+  {key:'left',     label:'Left side'},
+  {key:'right',    label:'Right side'},
+  {key:'interior', label:'Interior / cargo'},
+  {key:'other',    label:'Other / damage'},
+];
+
+function canSeeVehicles(){
+  return state.role === 'driver' || state.role === 'operations' || state.role === 'admin';
+}
+
+function friendlyDbError(e){
+  const msg = (e && e.message) || String(e);
+  if(authFailed && /permission/i.test(msg)){
+    return "Not signed in to the database (anonymous sign-in failed). In Firebase Console, go to Authentication → Sign-in method and make sure \"Anonymous\" is enabled, then reload this app.";
+  }
+  return msg;
+}
+
+async function loadVehicleChecks(){
+  if(!firebaseReady){ state.vehicleChecksLoaded = true; return; }
+  state.vehicleChecksLoading = true;
+  try{
+    const snap = await db.collection('vehicle_checks').get();
+    const list = snap.docs.map(d=>{
+      try{ return JSON.parse(d.data().metaJson); }catch(e){ return null; }
+    }).filter(Boolean);
+    list.sort((a,b)=> b.createdAt - a.createdAt);
+    state.vehicleChecks = list;
+    state.vehicleError = null;
+  }catch(e){
+    console.error('loadVehicleChecks failed:', e);
+    state.vehicleError = friendlyDbError(e);
+  }
+  state.vehicleChecksLoading = false;
+  state.vehicleChecksLoaded = true;
+}
+
+async function saveVehicleCheck(check, photos){
+  if(!firebaseReady){ lastDbError = 'Not connected to the database.'; return false; }
+  try{
+    const mainRef = db.collection('vehicle_checks').doc(check.id);
+    const batch = db.batch();
+    batch.set(mainRef, { metaJson: JSON.stringify(check), createdAt: check.createdAt });
+    Object.keys(photos).forEach(slot=>{
+      batch.set(mainRef.collection('photos').doc(slot), { data: photos[slot] });
+    });
+    await batch.commit();
+    return true;
+  }catch(e){
+    console.error('saveVehicleCheck failed:', e);
+    lastDbError = friendlyDbError(e);
+    return false;
+  }
+}
+
+async function loadVehiclePhotos(check){
+  if(check._photos) return check._photos;
+  const photos = {};
+  try{
+    const snap = await db.collection('vehicle_checks').doc(check.id).collection('photos').get();
+    snap.docs.forEach(d=>{ photos[d.id] = d.data().data; });
+    check._photos = photos;
+  }catch(e){
+    console.error('loadVehiclePhotos failed:', e);
+    return null;
+  }
+  return photos;
+}
+
+async function deleteVehicleCheck(id){
+  if(!firebaseReady){ lastDbError = 'Not connected to the database.'; return false; }
+  try{
+    const mainRef = db.collection('vehicle_checks').doc(id);
+    const snap = await mainRef.collection('photos').get();
+    const batch = db.batch();
+    snap.docs.forEach(d=> batch.delete(d.ref));
+    batch.delete(mainRef);
+    await batch.commit();
+    return true;
+  }catch(e){
+    console.error('deleteVehicleCheck failed:', e);
+    lastDbError = friendlyDbError(e);
+    return false;
+  }
+}
+
 // ---------- Init ----------
 async function init(){
   await initFirebase();
@@ -991,6 +1141,7 @@ function render(){
 
   if(state.screen === 'home') renderHome(content);
   if(state.screen === 'route') renderRoute(content);
+  if(state.screen === 'vehicles') renderVehicles(content);
   if(state.screen === 'odt_detail') renderOdtDetail(content);
 
   renderTabbar(app);
@@ -1152,6 +1303,9 @@ function renderTabbar(app){
   const tabs = state.role === 'driver'
     ? [{key:'route', icon:'🛣️', label:'Route'}, {key:'home', icon:'📋', label:'Manifest'}]
     : [{key:'home', icon:'📋', label:'Manifest'}];
+  if(canSeeVehicles()){
+    tabs.push({key:'vehicles', icon:'🚐', label:'Vehicles'});
+  }
 
   bar.innerHTML = tabs.map(t=>`
     <div class="tab-item ${state.screen===t.key?'active':''}" data-key="${t.key}">
@@ -1165,7 +1319,7 @@ function renderTabbar(app){
     });
   });
 
-  if(state.role === 'operations'){
+  if(state.role === 'operations' && state.screen !== 'vehicles'){
     const fab = document.createElement('button');
     fab.className = 'fab';
     fab.textContent = '+';
@@ -1173,7 +1327,7 @@ function renderTabbar(app){
     fab.addEventListener('click', ()=>{ state.modal = {type:'create'}; render(); });
     app.appendChild(fab);
   }
-  if(state.role === 'driver'){
+  if(state.role === 'driver' && state.screen !== 'vehicles'){
     const fab = document.createElement('button');
     fab.className = 'fab fab-scan';
     fab.textContent = '🔳';
@@ -1838,6 +1992,8 @@ function renderModal(app){
   if(state.modal.type === 'scan') renderScanModal(sheet);
   if(state.modal.type === 'delete') renderDeleteModal(sheet);
   if(state.modal.type === 'bulkDelete') renderBulkDeleteModal(sheet);
+  if(state.modal.type === 'vehicleCheck') renderVehicleCheckModal(sheet);
+  if(state.modal.type === 'vehicleView') renderVehicleViewModal(sheet);
 }
 
 // --- Create ODT modal (Operations) ---
@@ -2216,6 +2372,387 @@ function renderDeleteModal(sheet){
     showToast(`${odt.id} deleted`);
     render();
   });
+}
+
+// ---------- Vehicles screen (Driver / Operations / Admin) ----------
+function vehicleKey(name){ return (name || '').trim().toLowerCase(); }
+function daysSinceDay(ts){
+  const a = new Date(ts); a.setHours(0,0,0,0);
+  const b = new Date(); b.setHours(0,0,0,0);
+  return Math.round((b - a) / 86400000);
+}
+function vehicleStatus(ts){
+  const d = daysSinceDay(ts);
+  if(d <= 0) return {cls:'veh-ok',   label:'Checked today'};
+  if(d <= 7) return {cls:'veh-warn', label:`${d} day${d>1?'s':''} ago`};
+  return {cls:'veh-late', label:`Overdue · ${d} days`};
+}
+
+function renderVehicles(content){
+  if(!canSeeVehicles()){
+    content.innerHTML = '<p>You do not have access to this section.</p>';
+    return;
+  }
+
+  // Load on first visit only — keeps app start-up light.
+  if(!state.vehicleChecksLoaded && !state.vehicleChecksLoading){
+    loadVehicleChecks().then(()=>{ if(state.screen === 'vehicles') render(); });
+  }
+
+  const head = document.createElement('div');
+  head.className = 'section-head';
+  head.innerHTML = `<h2>Vehicle photos</h2><span class="count">${state.vehicleChecks.length} check${state.vehicleChecks.length!==1?'s':''}</span>`;
+  content.appendChild(head);
+
+  const newBtn = document.createElement('button');
+  newBtn.className = 'btn btn-stamp';
+  newBtn.style.marginBottom = '16px';
+  newBtn.textContent = '📷  New photo check';
+  newBtn.addEventListener('click', ()=>{ state.modal = {type:'vehicleCheck'}; render(); });
+  content.appendChild(newBtn);
+
+  const retention = document.createElement('div');
+  retention.className = 'note-text';
+  retention.style.cssText = 'margin:-6px 0 16px;text-align:center;';
+  retention.textContent = 'Photos are stored and stay accessible for at least 180 days.';
+  content.appendChild(retention);
+
+  if(state.vehicleChecksLoading && !state.vehicleChecksLoaded){
+    const l = document.createElement('div');
+    l.style = 'padding:40px 20px;text-align:center;color:var(--muted);font-size:13px;';
+    l.textContent = 'Loading vehicle checks…';
+    content.appendChild(l);
+    return;
+  }
+
+  if(state.vehicleError){
+    const err = document.createElement('div');
+    err.className = 'card';
+    err.style = 'border:1.5px solid var(--stamp-red);margin-bottom:14px;';
+    err.innerHTML = `
+      <div style="font-weight:700;color:var(--stamp-red);margin-bottom:6px;">⚠️ Couldn't load vehicle checks</div>
+      <div style="font-size:12.5px;color:var(--muted-dark);line-height:1.5;margin-bottom:12px;">${escapeHtml(state.vehicleError)}</div>
+      <button class="btn btn-outline btn-sm" id="retryVehBtn">Retry</button>
+    `;
+    content.appendChild(err);
+    err.querySelector('#retryVehBtn').addEventListener('click', async ()=>{
+      await loadVehicleChecks();
+      render();
+    });
+  }
+
+  if(state.vehicleChecks.length === 0){
+    if(!state.vehicleError){
+      const empty = document.createElement('div');
+      empty.className = 'empty-state';
+      empty.innerHTML = `
+        <span class="eicon">🚐</span>
+        <div class="etitle">No vehicle checks yet</div>
+        <div class="edesc">Take the first set of photos of the vehicle — front, rear, both sides and interior — so any damage can be traced to a date.</div>
+      `;
+      content.appendChild(empty);
+    }
+    return;
+  }
+
+  // One summary card per vehicle, most overdue first.
+  const byVehicle = {};
+  state.vehicleChecks.forEach(c=>{
+    const k = vehicleKey(c.vehicle);
+    if(!byVehicle[k]) byVehicle[k] = {name:c.vehicle, last:c, count:0};
+    byVehicle[k].count++;
+  });
+  const summaries = Object.values(byVehicle).sort((a,b)=> a.last.createdAt - b.last.createdAt);
+
+  summaries.forEach(v=>{
+    const st = vehicleStatus(v.last.createdAt);
+    const card = document.createElement('div');
+    card.className = 'card veh-card';
+    card.innerHTML = `
+      <div class="veh-row">
+        <div>
+          <div class="veh-name">🚐 ${escapeHtml(v.name)}</div>
+          <div class="veh-sub">Last check ${formatDate(v.last.createdAt)} · ${escapeHtml(v.last.by)}</div>
+        </div>
+        <span style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">
+          <span class="veh-chip ${st.cls}">${st.label}</span>
+          ${v.last.damage ? '<span class="veh-chip veh-damage">⚠ Damage noted</span>' : ''}
+        </span>
+      </div>
+    `;
+    content.appendChild(card);
+  });
+
+  // History, filterable by vehicle.
+  const hist = document.createElement('div');
+  hist.className = 'section-head';
+  hist.style.marginTop = '22px';
+  hist.innerHTML = '<h2>History</h2>';
+  content.appendChild(hist);
+
+  if(state.vehicleFilter !== 'all' && !byVehicle[state.vehicleFilter]) state.vehicleFilter = 'all';
+  if(summaries.length > 1){
+    const pills = document.createElement('div');
+    pills.className = 'filter-pills';
+    const opts = [{k:'all', label:'All vehicles'}].concat(
+      summaries.map(v=>({k:vehicleKey(v.name), label:v.name}))
+    );
+    opts.forEach(o=>{
+      const p = document.createElement('div');
+      p.className = 'filter-pill' + (state.vehicleFilter===o.k ? ' active' : '');
+      p.textContent = o.label;
+      p.addEventListener('click', ()=>{ state.vehicleFilter = o.k; render(); });
+      pills.appendChild(p);
+    });
+    content.appendChild(pills);
+  }
+
+  state.vehicleChecks
+    .filter(c => state.vehicleFilter === 'all' || vehicleKey(c.vehicle) === state.vehicleFilter)
+    .forEach(c=>{
+      const row = document.createElement('div');
+      row.className = 'card veh-card';
+      row.style.cursor = 'pointer';
+      row.innerHTML = `
+        <div class="veh-row">
+          <div>
+            <div class="veh-name">${escapeHtml(c.vehicle)}</div>
+            <div class="veh-sub">${formatDate(c.createdAt)} · ${escapeHtml(c.by)} · ${c.type === 'weekly' ? 'Weekly' : 'Daily'} · ${c.slots.length} photo${c.slots.length!==1?'s':''}</div>
+          </div>
+          ${c.damage ? '<span class="veh-chip veh-damage">⚠ Damage</span>' : '<span class="veh-chip veh-ok">OK</span>'}
+        </div>
+      `;
+      row.addEventListener('click', ()=>{ state.modal = {type:'vehicleView', checkId:c.id}; render(); });
+      content.appendChild(row);
+    });
+}
+
+// --- New vehicle photo check (Driver / Operations / Admin) ---
+function renderVehicleCheckModal(sheet){
+  const title = document.createElement('div');
+  title.className = 'modal-title';
+  title.textContent = 'New vehicle photo check';
+  sheet.appendChild(title);
+
+  // Vehicle names already used (previous checks + load check-ins) for quick picking.
+  const known = {};
+  state.vehicleChecks.forEach(c=>{ if(c.vehicle) known[vehicleKey(c.vehicle)] = c.vehicle; });
+  state.odts.forEach(o=>{ if(o.vehicleId) known[vehicleKey(o.vehicleId)] = known[vehicleKey(o.vehicleId)] || o.vehicleId; });
+
+  const form = document.createElement('div');
+  form.innerHTML = `
+    <label class="field-label">Vehicle / plate</label>
+    <input type="text" id="vcVehicle" list="vcVehicleList" placeholder="e.g. Van 3 — 4521 GLM" />
+    <datalist id="vcVehicleList">
+      ${Object.values(known).map(n=>`<option value="${escapeHtml(n)}"></option>`).join('')}
+    </datalist>
+
+    <label class="field-label" style="margin-top:14px;">Your name</label>
+    <input type="text" id="vcBy" placeholder="Who is taking the photos?" />
+
+    <label class="field-label" style="margin-top:14px;">Check type</label>
+    <div class="seg-row">
+      <button type="button" class="seg-btn active" data-type="daily">Daily</button>
+      <button type="button" class="seg-btn" data-type="weekly">Weekly</button>
+    </div>
+
+    <label class="field-label">Photos <span class="optional-tag">(at least one — ideally all four sides)</span></label>
+    <div class="photo-slot-grid" id="vcSlots">
+      ${VEHICLE_SLOTS.map(s=>`
+        <div class="photo-slot" data-slot="${s.key}">
+          <span class="ps-icon">📷</span>
+          <span class="ps-label">${s.label}</span>
+          <input type="file" accept="image/*" capture="environment" style="display:none;" />
+        </div>
+      `).join('')}
+    </div>
+    <div id="vcPhotoWarn" class="note-text" style="display:none;color:var(--stamp-red);margin-bottom:10px;">Take at least one photo.</div>
+
+    <div class="urgent-toggle-row" style="margin-top:14px;">
+      <div>
+        <div class="urgent-toggle-title">⚠️ Damage or issue spotted</div>
+        <div class="urgent-toggle-sub">Flags this check so it's easy to find</div>
+      </div>
+      <div class="switch" id="vcDamageSwitch"><div class="switch-knob"></div></div>
+    </div>
+
+    <label class="field-label">Notes <span class="optional-tag">(optional)</span></label>
+    <input type="text" id="vcNotes" placeholder="e.g. scratch on rear bumper" />
+
+    <button class="btn btn-stamp" id="vcSubmitBtn" style="margin-top:18px;">Save photo check</button>
+  `;
+  sheet.appendChild(form);
+
+  let checkType = 'daily';
+  let damage = false;
+  const photos = {};
+  let pending = 0;
+
+  form.querySelectorAll('.seg-btn').forEach(b=>{
+    b.addEventListener('click', ()=>{
+      checkType = b.dataset.type;
+      form.querySelectorAll('.seg-btn').forEach(x=> x.classList.toggle('active', x === b));
+    });
+  });
+
+  const dmgSwitch = form.querySelector('#vcDamageSwitch');
+  dmgSwitch.addEventListener('click', ()=>{
+    damage = !damage;
+    dmgSwitch.classList.toggle('switch-on', damage);
+  });
+
+  const vehicleInput = form.querySelector('#vcVehicle');
+  const byInput = form.querySelector('#vcBy');
+  [vehicleInput, byInput].forEach(el=> el.addEventListener('input', ()=> el.classList.remove('input-error')));
+
+  const grid = form.querySelector('#vcSlots');
+  const photoWarn = form.querySelector('#vcPhotoWarn');
+  grid.querySelectorAll('.photo-slot').forEach(slotEl=>{
+    const input = slotEl.querySelector('input');
+    const label = slotEl.querySelector('.ps-label');
+    const baseLabel = label.textContent;
+    slotEl.addEventListener('click', ()=> input.click());
+    input.addEventListener('click', e=> e.stopPropagation());
+    input.addEventListener('change', async (e)=>{
+      const file = e.target.files[0];
+      if(!file) return;
+      pending++;
+      label.textContent = 'Processing…';
+      try{
+        const data = await compressImageToFit(file, 150000);
+        photos[slotEl.dataset.slot] = data;
+        slotEl.style.backgroundImage = `url(${data})`;
+        slotEl.classList.add('filled');
+        slotEl.querySelector('.ps-icon').style.display = 'none';
+        label.textContent = baseLabel + ' ✓';
+        grid.classList.remove('input-error');
+        photoWarn.style.display = 'none';
+      }catch(err){
+        label.textContent = baseLabel;
+        showToast('Could not process that photo, please try another');
+      }
+      pending--;
+    });
+  });
+
+  form.querySelector('#vcSubmitBtn').addEventListener('click', async ()=>{
+    const vehicle = vehicleInput.value.trim();
+    const by = byInput.value.trim();
+    let hasError = false;
+    if(!vehicle){ vehicleInput.classList.add('input-error'); hasError = true; }
+    if(!by){ byInput.classList.add('input-error'); hasError = true; }
+    if(pending > 0){ showToast('Wait for the photos to finish processing'); return; }
+    if(Object.keys(photos).length === 0){
+      grid.classList.add('input-error');
+      photoWarn.style.display = 'block';
+      hasError = true;
+    }
+    if(hasError) return;
+
+    const btn = form.querySelector('#vcSubmitBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Saving…';
+
+    const check = {
+      id: 'VC-' + Date.now().toString(36).toUpperCase(),
+      vehicle, by,
+      type: checkType,
+      damage,
+      notes: form.querySelector('#vcNotes').value.trim() || null,
+      createdAt: Date.now(),
+      slots: Object.keys(photos),
+    };
+    const ok = await saveVehicleCheck(check, photos);
+    if(!ok){
+      btn.disabled = false;
+      btn.innerHTML = 'Save photo check';
+      showToast('Save failed: ' + (lastDbError || 'could not reach the database'));
+      return;
+    }
+    check._photos = photos;
+    state.vehicleChecks.unshift(check);
+    state.modal = null;
+    showToast(`Photo check saved for ${vehicle}`);
+    render();
+  });
+}
+
+// --- View one vehicle check (photos load on demand); Admin can delete ---
+function renderVehicleViewModal(sheet){
+  const check = state.vehicleChecks.find(c=>c.id === state.modal.checkId);
+  if(!check){ state.modal = null; return; }
+
+  const title = document.createElement('div');
+  title.className = 'modal-title';
+  title.textContent = check.vehicle;
+  sheet.appendChild(title);
+
+  const body = document.createElement('div');
+  body.innerHTML = `
+    <div class="veh-sub" style="margin-bottom:6px;">${formatDate(check.createdAt)} · ${escapeHtml(check.by)} · ${check.type === 'weekly' ? 'Weekly' : 'Daily'} check</div>
+    ${check.damage ? '<span class="veh-chip veh-damage">⚠ Damage noted</span>' : ''}
+    ${check.notes ? `<p class="note-text" style="margin-top:10px;">Notes: ${escapeHtml(check.notes)}</p>` : ''}
+    <div id="vvPhotos" class="note-text" style="margin-top:12px;">Loading photos…</div>
+  `;
+  sheet.appendChild(body);
+
+  const photosEl = body.querySelector('#vvPhotos');
+  loadVehiclePhotos(check).then(photos=>{
+    if(!photos){ photosEl.textContent = "Couldn't load the photos. Close and try again."; return; }
+    const keys = VEHICLE_SLOTS.map(s=>s.key).filter(k=> photos[k]);
+    if(keys.length === 0){ photosEl.textContent = 'No photos stored for this check.'; return; }
+    photosEl.className = 'veh-photo-grid';
+    photosEl.innerHTML = keys.map(k=>{
+      const label = VEHICLE_SLOTS.find(s=>s.key===k).label;
+      return `<figure data-k="${k}"><img src="${photos[k]}" alt="${label}" /><figcaption>${label}</figcaption></figure>`;
+    }).join('');
+    photosEl.querySelectorAll('figure').forEach(f=>{
+      f.addEventListener('click', ()=> f.classList.toggle('big'));
+    });
+  });
+
+  if(state.role === 'admin'){
+    const danger = document.createElement('div');
+    danger.className = 'card';
+    danger.style = 'border:1.5px solid var(--stamp-red);margin-top:20px;';
+    danger.innerHTML = `
+      <div style="font-weight:700;color:var(--stamp-red);margin-bottom:4px;">Danger zone</div>
+      <div style="font-size:12px;color:var(--muted-dark);margin-bottom:10px;">Permanently deletes this photo check and its photos.</div>
+      <div id="vvDelStep1"><button class="btn btn-danger-outline btn-sm" id="vvDelBtn" style="width:auto;">Delete check</button></div>
+      <div id="vvDelStep2" style="display:none;">
+        <input type="password" id="vvDelPw" inputmode="numeric" placeholder="Admin password" maxlength="12" />
+        <button class="btn btn-danger-outline btn-sm" id="vvDelConfirm" style="width:auto;margin-top:8px;">Permanently delete</button>
+      </div>
+    `;
+    sheet.appendChild(danger);
+    danger.querySelector('#vvDelBtn').addEventListener('click', ()=>{
+      danger.querySelector('#vvDelStep1').style.display = 'none';
+      danger.querySelector('#vvDelStep2').style.display = 'block';
+      danger.querySelector('#vvDelPw').focus();
+    });
+    const pw = danger.querySelector('#vvDelPw');
+    pw.addEventListener('input', ()=> pw.classList.remove('input-error'));
+    danger.querySelector('#vvDelConfirm').addEventListener('click', async ()=>{
+      if(pw.value.trim() !== ADMIN_DELETE_PASSWORD){
+        pw.classList.add('input-error'); pw.value = ''; pw.focus();
+        showToast('Incorrect password');
+        return;
+      }
+      const btn = danger.querySelector('#vvDelConfirm');
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner"></span> Deleting…';
+      const ok = await deleteVehicleCheck(check.id);
+      if(!ok){
+        btn.disabled = false; btn.innerHTML = 'Permanently delete';
+        showToast('Delete failed: ' + (lastDbError || 'could not reach the database'));
+        return;
+      }
+      state.vehicleChecks = state.vehicleChecks.filter(c=> c.id !== check.id);
+      state.modal = null;
+      showToast('Photo check deleted');
+      render();
+    });
+  }
 }
 
 // --- Bulk delete modal (Admin only) — same password gate, many ODTs at once ---
